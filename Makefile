@@ -35,10 +35,12 @@ uninstall:
 	fi
 	@echo "Removed $(COMMAND)"
 
+SHELLCHECK ?= $(shell command -v shellcheck 2>/dev/null || echo /opt/homebrew/bin/shellcheck)
+
 check:
 	/bin/test -x bin/no-sleep
 	/bin/bash -n bin/no-sleep
-	/opt/homebrew/bin/shellcheck -x -s bash bin/no-sleep tests/test-no-sleep.sh
+	$(SHELLCHECK) -x -s bash bin/no-sleep tests/test-no-sleep.sh
 
 test: check
 	/bin/bash tests/test-no-sleep.sh

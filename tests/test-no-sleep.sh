@@ -200,6 +200,14 @@ run_command() {
     return 0
 }
 
+run_direct() {
+    set +e
+    COMMAND_OUTPUT=$("$@" 2>&1)
+    COMMAND_STATUS=$?
+    set -e
+    return 0
+}
+
 assert_status() {
     local expected
 
@@ -276,6 +284,22 @@ test_status_help_and_usage() {
     assert_status 0
     assert_contains "Usage:"
 
+    run_command help
+    assert_status 0
+    assert_contains "Usage:"
+
+    run_command -h
+    assert_status 0
+    assert_contains "Usage:"
+
+    run_command --version
+    assert_status 0
+    assert_contains "no-sleep 0.1.0"
+
+    run_command version
+    assert_status 0
+    assert_contains "no-sleep 0.1.0"
+
     run_command nonsense
     assert_status 64
     assert_contains "unknown command"
@@ -287,7 +311,6 @@ test_status_help_and_usage() {
 
 test_power_parser_contracts() {
     local actual
-    local live_plist
 
     actual=$(printf '%s\n' \
         "System-wide power settings:" \
@@ -295,19 +318,126 @@ test_power_parser_contracts() {
         "Currently in use:" | parse_persistent_sleep_disabled)
     [[ "$actual" == "1" ]]
 
+    actual=$(printf '%s\n' \
+        "System-wide power settings:" \
+        " SleepDisabled        0" \
+        "Currently in use:" | parse_persistent_sleep_disabled)
+    [[ "$actual" == "0" ]]
+
+    actual=$(printf '%s\n' \
+        "System-wide power settings:" \
+        "Currently in use:" | parse_persistent_sleep_disabled)
+    [[ "$actual" == "0" ]]
+
     if printf '%s\n' \
+        "System-wide power settings:" \
         " SleepDisabled 0" \
-        " SleepDisabled 1" | parse_persistent_sleep_disabled >/dev/null 2>&1; then
+        " SleepDisabled 1" \
+        "Currently in use:" | parse_persistent_sleep_disabled >/dev/null 2>&1; then
         printf 'duplicate SleepDisabled values should fail parsing\n' >&2
         return 1
     fi
 
-    live_plist="$TEST_ROOT/live.plist"
-    "$PLUTIL_BIN" -create xml1 "$live_plist"
-    "$PLUTIL_BIN" -insert 0 -dictionary "$live_plist"
-    "$PLUTIL_BIN" -insert 0.SleepDisabled -bool true "$live_plist"
-    actual=$(parse_live_sleep_disabled <"$live_plist")
+    if actual=$(printf '%s\n' \
+        "System-wide power settings:" \
+        " SleepDisabled 2" \
+        "Currently in use:" | parse_persistent_sleep_disabled); then
+        printf 'invalid SleepDisabled value should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' \
+        "System-wide power settings:" \
+        " SleepDisabled 1 unexpected" \
+        "Currently in use:" | parse_persistent_sleep_disabled); then
+        printf 'malformed SleepDisabled fields should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' \
+        "System-wide power settings:" \
+        " SleepDisabled 1" | parse_persistent_sleep_disabled); then
+        printf 'truncated pmset output should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' \
+        "Currently in use:" | parse_persistent_sleep_disabled); then
+        printf 'pmset output without the system header should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' \
+        "Currently in use:" \
+        "System-wide power settings:" | parse_persistent_sleep_disabled); then
+        printf 'reordered pmset headers should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' \
+        "System-wide power settings:" \
+        "Currently in use:" \
+        " SleepDisabled 1" | parse_persistent_sleep_disabled); then
+        printf 'misplaced SleepDisabled should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '' | parse_persistent_sleep_disabled); then
+        printf 'empty pmset output should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    actual=$(printf '%s\n' '[{}]' | parse_live_sleep_disabled)
+    [[ "$actual" == "0" ]]
+
+    actual=$(printf '%s\n' '[{"SleepDisabled":true}]' | parse_live_sleep_disabled)
     [[ "$actual" == "1" ]]
+
+    actual=$(printf '%s\n' '[{"SleepDisabled":false}]' | parse_live_sleep_disabled)
+    [[ "$actual" == "0" ]]
+
+    if actual=$(printf '' | parse_live_sleep_disabled); then
+        printf 'empty ioreg output should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' 'not a plist' | parse_live_sleep_disabled); then
+        printf 'malformed ioreg plist should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' '{}' | parse_live_sleep_disabled); then
+        printf 'non-array ioreg root should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' '["unexpected"]' | parse_live_sleep_disabled); then
+        printf 'non-dictionary root-domain entry should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' '[{},{}]' | parse_live_sleep_disabled); then
+        printf 'multiple root-domain entries should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
+
+    if actual=$(printf '%s\n' '[{"SleepDisabled":1}]' | parse_live_sleep_disabled); then
+        printf 'non-Boolean live SleepDisabled should fail parsing\n' >&2
+        return 1
+    fi
+    [[ -z "$actual" ]]
 }
 
 test_privileged_command_contract() {
@@ -669,6 +799,56 @@ test_concurrent_operation_fails_fast() {
     assert_file_absent "$(state_file)"
 }
 
+test_remove_state_dir_safety_guard() {
+    /bin/mkdir -p "$TEST_ROOT/unsafe-target"
+    /bin/ln -s "$TEST_ROOT/unsafe-target" "$(state_dir)"
+
+    run_direct remove_state
+    assert_status 1
+    assert_contains "refusing to remove state file from an unsafe directory"
+}
+
+test_toggle_refuses_corrupt_state() {
+    /bin/mkdir -m 700 "$(state_dir)"
+    printf 'corrupt data' > "$(state_file)"
+    /bin/chmod 600 "$(state_file)"
+
+    run_command toggle
+    assert_status 2
+    assert_contains "state journal is corrupt or unsafe"
+}
+
+test_forced_recovery_restores_sleep_with_unsafe_state_file() {
+    fake_write "persistent" "1"
+    fake_write "live" "1"
+    /bin/mkdir -m 700 "$(state_dir)"
+    printf 'corrupt data' > "$(state_file)"
+    /bin/chmod 644 "$(state_file)"
+
+    run_command off --force
+    assert_status 2
+    assert_contains "corrupt state path could not be removed"
+    assert_file_value "$(fake_path "persistent")" "0"
+    assert_file_value "$(fake_path "live")" "0"
+}
+
+test_external_baseline_invalidation_drift() {
+    fake_write "persistent" "1"
+    fake_write "live" "1"
+
+    run_command on
+    assert_status 0
+    assert_contains "pre-existing; will be preserved on off"
+    assert_state_value "pmset_changed" "false"
+
+    fake_write "persistent" "0"
+    fake_write "live" "0"
+
+    run_command on
+    assert_status 2
+    assert_contains "SleepDisabled changed externally"
+}
+
 run_test() {
     local name
     local function_name
@@ -719,6 +899,10 @@ run_test "power drift after removal retains state" test_power_drift_after_job_re
 run_test "power-source mismatch fails closed" test_mismatched_power_sources_fail_closed
 run_test "unsafe state directory fails closed" test_unsafe_state_directory_fails_closed
 run_test "concurrent operation fails fast" test_concurrent_operation_fails_fast
+run_test "remove_state directory safety guard" test_remove_state_dir_safety_guard
+run_test "toggle refuses corrupt state" test_toggle_refuses_corrupt_state
+run_test "forced recovery restores sleep with unsafe state file" test_forced_recovery_restores_sleep_with_unsafe_state_file
+run_test "external baseline invalidation drift" test_external_baseline_invalidation_drift
 
 printf '1..%d\n' "$TESTS_RUN"
 if [[ "$TESTS_FAILED" -ne 0 ]]; then
