@@ -89,3 +89,7 @@ make uninstall
 
 Uninstall first performs a verified ordinary `off` and aborts rather than
 discarding unresolved ownership state.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
