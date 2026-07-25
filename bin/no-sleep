@@ -1,0 +1,1304 @@
+#!/bin/bash
+
+# no-sleep: a small, personal macOS sleep toggle.
+#
+# Bash 3.2 compatible. Do not enable `set -e`: several expected probes return
+# non-zero, and transition failures must run explicit recovery paths.
+set -u
+set -o pipefail
+umask 077
+
+PROGRAM_NAME="no-sleep"
+PROGRAM_VERSION="0.1.0"
+JOB_LABEL="com.callmemorgan.no-sleep.caffeinate"
+STATE_SCHEMA_VERSION="1"
+
+CAFFEINATE_BIN="/usr/bin/caffeinate"
+PMSET_BIN="/usr/bin/pmset"
+SUDO_BIN="/usr/bin/sudo"
+LAUNCHCTL_BIN="/bin/launchctl"
+IOREG_BIN="/usr/sbin/ioreg"
+PLUTIL_BIN="/usr/bin/plutil"
+LOCKF_BIN="/usr/bin/lockf"
+PS_BIN="/bin/ps"
+AWK_BIN="/usr/bin/awk"
+STAT_BIN="/usr/bin/stat"
+INSTALL_BIN="/usr/bin/install"
+MKTEMP_BIN="/usr/bin/mktemp"
+MV_BIN="/bin/mv"
+RM_BIN="/bin/rm"
+CHMOD_BIN="/bin/chmod"
+DATE_BIN="/bin/date"
+SLEEP_BIN="/bin/sleep"
+UNAME_BIN="/usr/bin/uname"
+
+# The only allowed caffeinate command lines, newline-joined as launchctl reports
+# them. inspect_job compares against these before it will touch a job, so
+# launchctl_submit_job must keep spelling the same flags in the same order.
+CAFFEINATE_ARGV_SYSTEM="$CAFFEINATE_BIN"$'\n'"-i"
+CAFFEINATE_ARGV_DISPLAY="$CAFFEINATE_BIN"$'\n'"-d"$'\n'"-i"
+
+STATE_PHASE=""
+STATE_MODE=""
+STATE_PREVIOUS_SLEEP_DISABLED=""
+STATE_PMSET_CHANGED=""
+STATE_ENABLED_AT=""
+
+JOB_QUERY="unknown"
+JOB_VALID="0"
+JOB_RUNNING="0"
+JOB_MODE=""
+JOB_PID=""
+JOB_DIAGNOSTIC=""
+
+SLEEP_PERSISTENT=""
+SLEEP_LIVE=""
+
+TX_HAD_STATE="0"
+TX_OLD_PHASE=""
+TX_OLD_MODE=""
+TX_OLD_PREVIOUS=""
+TX_OLD_CHANGED=""
+TX_OLD_ENABLED_AT=""
+TX_PRIOR_JOB_PRESENT="0"
+TX_PRIOR_JOB_MODE=""
+TX_PMSET_BEFORE=""
+TX_PMSET_WRITE_ATTEMPTED="0"
+
+say() {
+    printf '%s\n' "$*"
+}
+
+warn() {
+    printf '%s: warning: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+fail() {
+    printf '%s: error: %s\n' "$PROGRAM_NAME" "$*" >&2
+}
+
+usage() {
+    cat <<'EOF'
+Usage:
+  no-sleep                          Show status
+  no-sleep status                   Show status
+  no-sleep on|enable [--display]    Prevent sleep
+  no-sleep off|disable [--force]    Restore sleep
+  no-sleep toggle [--display]       Toggle managed state
+  no-sleep --help                   Show this help
+
+Modes:
+  The default uses caffeinate -i, so the display may still turn off.
+  --display uses caffeinate -d -i and also keeps the display awake.
+
+Lifecycle:
+  caffeinate is scoped to the current login session. The pmset hard switch is
+  persistent and remains enabled until an explicit `no-sleep off`. After a
+  logout or reboot, status reports a degraded state until `on` or `off` runs.
+EOF
+}
+
+mode_label() {
+    if [[ "$1" == "display" ]]; then
+        printf 'system + display\n'
+    else
+        printf 'system only\n'
+    fi
+}
+
+state_dir() {
+    printf '%s\n' "${HOME}/.local/state/no-sleep"
+}
+
+state_file() {
+    printf '%s/state.plist\n' "$(state_dir)"
+}
+
+lock_file() {
+    printf '%s/operation.lock\n' "$(state_dir)"
+}
+
+current_uid() {
+    printf '%s\n' "${EUID}"
+}
+
+now_utc() {
+    "$DATE_BIN" -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+retry_pause() {
+    "$SLEEP_BIN" 0.1
+}
+
+preflight() {
+    local kernel
+    local required
+
+    kernel=$("$UNAME_BIN" -s 2>/dev/null) || {
+        fail "unable to determine the operating system"
+        return 1
+    }
+    if [[ "$kernel" != "Darwin" ]]; then
+        fail "this tool only supports macOS"
+        return 1
+    fi
+
+    if [[ "${EUID}" -eq 0 ]]; then
+        fail "run no-sleep as your login user, not with sudo"
+        return 1
+    fi
+
+    if [[ -z "${HOME:-}" || "${HOME}" != /* ]]; then
+        fail "HOME must be a non-empty absolute path"
+        return 1
+    fi
+
+    for required in \
+        "$CAFFEINATE_BIN" "$PMSET_BIN" "$SUDO_BIN" "$LAUNCHCTL_BIN" \
+        "$IOREG_BIN" "$PLUTIL_BIN" "$LOCKF_BIN" "$PS_BIN" "$AWK_BIN" \
+        "$STAT_BIN" "$INSTALL_BIN" "$MKTEMP_BIN" "$MV_BIN" "$RM_BIN" \
+        "$CHMOD_BIN" "$DATE_BIN" "$SLEEP_BIN"; do
+        if [[ ! -x "$required" ]]; then
+            fail "required macOS tool is unavailable: $required"
+            return 1
+        fi
+    done
+}
+
+# Returns 0 when the path exists and is a user-owned, non-symlink node of the
+# expected type and mode; 1 when it is absent; 2 when it exists but is unsafe.
+# load_state shares this 0/1/2 convention.
+path_is_safe() {
+    local path
+    local kind
+    local expected_mode
+    local attributes
+    local owner
+    local mode
+
+    path="$1"
+    kind="$2"
+    expected_mode="$3"
+
+    if [[ ! -e "$path" && ! -L "$path" ]]; then
+        return 1
+    fi
+    if [[ -L "$path" ]]; then
+        return 2
+    fi
+    case "$kind" in
+        d) [[ -d "$path" ]] || return 2 ;;
+        f) [[ -f "$path" ]] || return 2 ;;
+        *) return 2 ;;
+    esac
+    attributes=$("$STAT_BIN" -f '%u %Lp' "$path" 2>/dev/null) || return 2
+    owner="${attributes%% *}"
+    mode="${attributes##* }"
+    if [[ "$owner" != "$(current_uid)" || "$mode" != "$expected_mode" ]]; then
+        return 2
+    fi
+    return 0
+}
+
+state_dir_is_safe() {
+    path_is_safe "$(state_dir)" d 700
+}
+
+ensure_state_dir() {
+    local dir
+    local rc
+
+    dir=$(state_dir)
+    state_dir_is_safe
+    rc=$?
+    case "$rc" in
+        0)
+            "$CHMOD_BIN" 700 "$dir" 2>/dev/null || {
+                fail "cannot secure state directory: $dir"
+                return 1
+            }
+            ;;
+        1)
+            "$INSTALL_BIN" -d -m 700 "$dir" || {
+                fail "cannot create state directory: $dir"
+                return 1
+            }
+            ;;
+        *)
+            fail "state directory is unsafe (must be a user-owned directory, not a symlink): $dir"
+            return 1
+            ;;
+    esac
+
+    state_dir_is_safe || {
+        fail "state directory failed its ownership check: $dir"
+        return 1
+    }
+}
+
+state_file_is_safe() {
+    path_is_safe "$(state_file)" f 600
+}
+
+with_operation_lock() (
+    local lock
+    local owner
+
+    ensure_state_dir || exit 1
+    lock=$(lock_file)
+
+    if [[ -e "$lock" || -L "$lock" ]]; then
+        if [[ -L "$lock" || ! -f "$lock" ]]; then
+            fail "operation lock is unsafe: $lock"
+            exit 1
+        fi
+        owner=$("$STAT_BIN" -f '%u' "$lock" 2>/dev/null) || {
+            fail "cannot inspect operation lock: $lock"
+            exit 1
+        }
+        if [[ "$owner" != "$(current_uid)" ]]; then
+            fail "operation lock is not owned by the current user: $lock"
+            exit 1
+        fi
+    fi
+
+    exec 9>>"$lock" || {
+        fail "cannot open operation lock: $lock"
+        exit 1
+    }
+    "$CHMOD_BIN" 600 "$lock" 2>/dev/null || {
+        fail "cannot secure operation lock: $lock"
+        exit 1
+    }
+    if ! "$LOCKF_BIN" -s -t 0 9; then
+        fail "another no-sleep operation is already in progress"
+        exit 75
+    fi
+
+    "$@"
+)
+
+plist_extract() {
+    local key
+    local expected_type
+    local file
+
+    key="$1"
+    expected_type="$2"
+    file="$3"
+    "$PLUTIL_BIN" -extract "$key" raw -expect "$expected_type" -o - "$file" 2>/dev/null
+}
+
+# The single description of a well-formed ownership record, shared by the
+# reader and the writer so the two can never drift apart.
+state_fields_are_valid() {
+    local phase
+    local mode
+    local previous
+    local changed
+    local enabled_at
+
+    phase="$1"
+    mode="$2"
+    previous="$3"
+    changed="$4"
+    enabled_at="$5"
+
+    case "$phase" in enabling|enabled|disabling) ;; *) return 1 ;; esac
+    case "$mode" in system|display) ;; *) return 1 ;; esac
+    # pmset_changed is true exactly when the recorded baseline was 0.
+    case "${previous}:${changed}" in 0:true|1:false) ;; *) return 1 ;; esac
+    [[ -n "$enabled_at" ]] || return 1
+    return 0
+}
+
+load_state() {
+    local file
+    local schema
+    local phase
+    local mode
+    local previous
+    local changed
+    local enabled_at
+
+    state_dir_is_safe || return $?
+    state_file_is_safe || return $?
+
+    file=$(state_file)
+    "$PLUTIL_BIN" -lint -s "$file" >/dev/null 2>&1 || return 2
+
+    schema=$(plist_extract "schema_version" "integer" "$file") || return 2
+    phase=$(plist_extract "phase" "string" "$file") || return 2
+    mode=$(plist_extract "mode" "string" "$file") || return 2
+    previous=$(plist_extract "previous_sleep_disabled" "integer" "$file") || return 2
+    changed=$(plist_extract "pmset_changed" "bool" "$file") || return 2
+    enabled_at=$(plist_extract "enabled_at" "string" "$file") || return 2
+
+    [[ "$schema" == "$STATE_SCHEMA_VERSION" ]] || return 2
+    state_fields_are_valid "$phase" "$mode" "$previous" "$changed" "$enabled_at" || return 2
+
+    STATE_PHASE="$phase"
+    STATE_MODE="$mode"
+    STATE_PREVIOUS_SLEEP_DISABLED="$previous"
+    STATE_PMSET_CHANGED="$changed"
+    STATE_ENABLED_AT="$enabled_at"
+    return 0
+}
+
+write_state() {
+    local phase
+    local mode
+    local previous
+    local changed
+    local enabled_at
+    local dir
+    local file
+    local temp
+    local existing_rc
+
+    phase="$1"
+    mode="$2"
+    previous="$3"
+    changed="$4"
+    enabled_at="$5"
+
+    state_fields_are_valid "$phase" "$mode" "$previous" "$changed" "$enabled_at" || return 1
+
+    ensure_state_dir || return 1
+    state_file_is_safe
+    existing_rc=$?
+    if [[ "$existing_rc" -eq 2 ]]; then
+        fail "refusing to replace an unsafe state file"
+        return 1
+    fi
+
+    dir=$(state_dir)
+    file=$(state_file)
+    temp=$("$MKTEMP_BIN" "${dir}/state.plist.tmp.XXXXXX") || {
+        fail "cannot create a temporary state file"
+        return 1
+    }
+
+    if ! "$PLUTIL_BIN" -create xml1 "$temp" >/dev/null 2>&1 \
+        || ! "$PLUTIL_BIN" -insert schema_version -integer "$STATE_SCHEMA_VERSION" "$temp" >/dev/null 2>&1 \
+        || ! "$PLUTIL_BIN" -insert phase -string "$phase" "$temp" >/dev/null 2>&1 \
+        || ! "$PLUTIL_BIN" -insert mode -string "$mode" "$temp" >/dev/null 2>&1 \
+        || ! "$PLUTIL_BIN" -insert previous_sleep_disabled -integer "$previous" "$temp" >/dev/null 2>&1 \
+        || ! "$PLUTIL_BIN" -insert pmset_changed -bool "$changed" "$temp" >/dev/null 2>&1 \
+        || ! "$PLUTIL_BIN" -insert enabled_at -string "$enabled_at" "$temp" >/dev/null 2>&1; then
+        "$RM_BIN" -f "$temp"
+        fail "cannot serialize ownership state"
+        return 1
+    fi
+
+    "$CHMOD_BIN" 600 "$temp" || {
+        "$RM_BIN" -f "$temp"
+        fail "cannot secure ownership state"
+        return 1
+    }
+    "$MV_BIN" -f "$temp" "$file" || {
+        "$RM_BIN" -f "$temp"
+        fail "cannot atomically install ownership state"
+        return 1
+    }
+}
+
+remove_state() {
+    local file
+    local rc
+
+    state_file_is_safe
+    rc=$?
+    if [[ "$rc" -eq 1 ]]; then
+        return 0
+    elif [[ "$rc" -ne 0 ]]; then
+        fail "refusing to remove an unsafe state file"
+        return 1
+    fi
+    file=$(state_file)
+    "$RM_BIN" -f "$file"
+}
+
+parse_persistent_sleep_disabled() {
+    # shellcheck disable=SC2016
+    "$AWK_BIN" '
+        $1 == "SleepDisabled" && ($2 == "0" || $2 == "1") {
+            count += 1
+            value = $2
+        }
+        END {
+            if (count == 1) {
+                print value
+            } else {
+                exit 1
+            }
+        }
+    '
+}
+
+read_persistent_sleep_disabled() {
+    LC_ALL=C "$PMSET_BIN" -g 2>/dev/null | parse_persistent_sleep_disabled
+}
+
+parse_live_sleep_disabled() {
+    local value
+
+    value=$("$PLUTIL_BIN" -extract "0.SleepDisabled" raw -o - - 2>/dev/null) || return 1
+    case "$value" in
+        true) printf '1\n' ;;
+        false) printf '0\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+read_live_sleep_disabled() {
+    "$IOREG_BIN" -a -r -c IOPMrootDomain -d 1 2>/dev/null | parse_live_sleep_disabled
+}
+
+read_sleep_pair_once() {
+    local persistent
+    local live
+
+    persistent=$(read_persistent_sleep_disabled) || return 1
+    live=$(read_live_sleep_disabled) || return 1
+    case "$persistent" in 0|1) ;; *) return 1 ;; esac
+    case "$live" in 0|1) ;; *) return 1 ;; esac
+
+    SLEEP_PERSISTENT="$persistent"
+    SLEEP_LIVE="$live"
+    [[ "$persistent" == "$live" ]]
+}
+
+# Polls a predicate up to a bounded number of attempts, pausing between tries.
+# Every wait in this script goes through here so the retry budgets stay visible
+# and comparable at the call sites.
+retry_until() {
+    local attempts
+    local attempt
+
+    attempts="$1"
+    shift
+
+    attempt=0
+    while [[ "$attempt" -lt "$attempts" ]]; do
+        if "$@"; then
+            return 0
+        fi
+        attempt=$((attempt + 1))
+        retry_pause
+    done
+    return 1
+}
+
+sleep_pair_is() {
+    read_sleep_pair_once \
+        && [[ "$SLEEP_PERSISTENT" == "$1" ]] \
+        && [[ "$SLEEP_LIVE" == "$1" ]]
+}
+
+read_consistent_sleep_pair() {
+    retry_until 10 read_sleep_pair_once
+}
+
+require_consistent_sleep_pair() {
+    read_consistent_sleep_pair && return 0
+    fail "persistent and live SleepDisabled values are unavailable or disagree"
+    return 2
+}
+
+verify_sleep_disabled() {
+    case "$1" in 0|1) ;; *) return 1 ;; esac
+    retry_until 20 sleep_pair_is "$1"
+}
+
+sudo_authorize() {
+    "$SUDO_BIN" -v
+}
+
+require_sudo_authorization() {
+    sudo_authorize && return 0
+    fail "administrator authorization was not granted"
+    return 1
+}
+
+invoke_sudo_pmset() {
+    local value
+
+    value="$1"
+    case "$value" in 0|1) ;; *) return 64 ;; esac
+    "$SUDO_BIN" -- "$PMSET_BIN" -a disablesleep "$value"
+}
+
+sudo_write_sleep_disabled() {
+    invoke_sudo_pmset "$@"
+}
+
+apply_sleep_disabled() {
+    local expected
+    local command_rc
+
+    expected="$1"
+    sudo_write_sleep_disabled "$expected"
+    command_rc=$?
+
+    if verify_sleep_disabled "$expected"; then
+        return 0
+    fi
+
+    if [[ "$command_rc" -ne 0 ]]; then
+        fail "pmset command failed and SleepDisabled did not become $expected"
+    else
+        fail "pmset reported success, but SleepDisabled did not become $expected"
+    fi
+    return 1
+}
+
+launchctl_list_job() {
+    "$LAUNCHCTL_BIN" list "$JOB_LABEL"
+}
+
+launchctl_submit_job() {
+    local mode
+
+    mode="$1"
+    case "$mode" in
+        system)
+            "$LAUNCHCTL_BIN" submit -l "$JOB_LABEL" -o /dev/null -e /dev/null -- "$CAFFEINATE_BIN" -i
+            ;;
+        display)
+            "$LAUNCHCTL_BIN" submit -l "$JOB_LABEL" -o /dev/null -e /dev/null -- "$CAFFEINATE_BIN" -d -i
+            ;;
+        *)
+            return 64
+            ;;
+    esac
+}
+
+launchctl_remove_job() {
+    "$LAUNCHCTL_BIN" remove "$JOB_LABEL"
+}
+
+ps_job_line() {
+    local pid
+
+    pid="$1"
+    "$PS_BIN" -ww -p "$pid" -o uid= -o command=
+}
+
+inspect_job() {
+    local output
+    local rc
+    local parsed_label
+    local parsed_program
+    local parsed_arguments
+    local parsed_pid
+    local process_line
+    local process_uid
+    local process_command
+    local expected_command
+
+    JOB_QUERY="unknown"
+    JOB_VALID="0"
+    JOB_RUNNING="0"
+    JOB_MODE=""
+    JOB_PID=""
+    JOB_DIAGNOSTIC=""
+
+    output=$(launchctl_list_job 2>/dev/null)
+    rc=$?
+    if [[ "$rc" -eq 113 ]]; then
+        JOB_QUERY="absent"
+        return 0
+    elif [[ "$rc" -ne 0 ]]; then
+        JOB_DIAGNOSTIC="launchctl list failed with status $rc"
+        return 1
+    fi
+
+    JOB_QUERY="present"
+    # shellcheck disable=SC2016
+    parsed_label=$(printf '%s\n' "$output" | "$AWK_BIN" -F'"' '
+        /"Label"[[:space:]]*=/ { print $4; exit }
+    ')
+    # shellcheck disable=SC2016
+    parsed_program=$(printf '%s\n' "$output" | "$AWK_BIN" -F'"' '
+        /"Program"[[:space:]]*=/ { print $4; exit }
+    ')
+    # shellcheck disable=SC2016
+    parsed_arguments=$(printf '%s\n' "$output" | "$AWK_BIN" '
+        /"ProgramArguments"[[:space:]]*=[[:space:]]*\(/ { inside = 1; next }
+        inside && /\);/ { exit }
+        inside {
+            line = $0
+            sub(/^[[:space:]]*"/, "", line)
+            sub(/";[[:space:]]*$/, "", line)
+            print line
+        }
+    ')
+    if [[ "$parsed_label" != "$JOB_LABEL" || "$parsed_program" != "$CAFFEINATE_BIN" ]]; then
+        JOB_DIAGNOSTIC="launchctl label or program does not match the managed job"
+        return 0
+    fi
+    if [[ "$parsed_arguments" == "$CAFFEINATE_ARGV_SYSTEM" ]]; then
+        JOB_MODE="system"
+        expected_command="${CAFFEINATE_ARGV_SYSTEM//$'\n'/ }"
+    elif [[ "$parsed_arguments" == "$CAFFEINATE_ARGV_DISPLAY" ]]; then
+        JOB_MODE="display"
+        expected_command="${CAFFEINATE_ARGV_DISPLAY//$'\n'/ }"
+    else
+        JOB_DIAGNOSTIC="launchctl arguments do not match an allowed caffeinate mode"
+        return 0
+    fi
+    JOB_VALID="1"
+
+    # shellcheck disable=SC2016
+    parsed_pid=$(printf '%s\n' "$output" | "$AWK_BIN" '
+        /"PID"[[:space:]]*=/ {
+            line = $0
+            sub(/^.*=[[:space:]]*/, "", line)
+            sub(/;.*/, "", line)
+            print line
+            exit
+        }
+    ')
+    case "$parsed_pid" in
+        ''|*[!0-9]*)
+            JOB_DIAGNOSTIC="managed launchd job is loaded but not running"
+            return 0
+            ;;
+    esac
+
+    process_line=$(ps_job_line "$parsed_pid" 2>/dev/null) || {
+        JOB_DIAGNOSTIC="managed launchd job has no live process"
+        return 0
+    }
+    read -r process_uid process_command <<<"$process_line"
+    if [[ "$process_uid" != "$(current_uid)" || "$process_command" != "$expected_command" ]]; then
+        JOB_VALID="0"
+        JOB_DIAGNOSTIC="launchd PID identity does not match the managed caffeinate command"
+        return 0
+    fi
+
+    JOB_RUNNING="1"
+    JOB_PID="$parsed_pid"
+    JOB_DIAGNOSTIC=""
+    return 0
+}
+
+job_is_running_mode() {
+    inspect_job
+    [[ "$JOB_QUERY" == "present" \
+        && "$JOB_VALID" == "1" \
+        && "$JOB_RUNNING" == "1" \
+        && "$JOB_MODE" == "$1" ]]
+}
+
+job_is_absent() {
+    inspect_job
+    [[ "$JOB_QUERY" == "absent" ]]
+}
+
+wait_for_job_mode() {
+    retry_until 30 job_is_running_mode "$1"
+}
+
+wait_for_job_absent() {
+    retry_until 30 job_is_absent
+}
+
+inspect_job_or_fail() {
+    inspect_job && return 0
+    fail "cannot determine launchd job state"
+    return 1
+}
+
+# Reports whether the label is absent or verifiably ours, warning with the
+# caller's context when it is not. Callers phrase their own recovery advice.
+job_is_safe_to_remove() {
+    local suffix
+
+    suffix="$1"
+    if ! inspect_job; then
+        warn "cannot query the no-sleep launchd job${suffix}"
+        return 1
+    fi
+    if [[ "$JOB_QUERY" == "present" && "$JOB_VALID" != "1" ]]; then
+        warn "refusing to remove an unrecognized job using the no-sleep label${suffix}"
+        return 1
+    fi
+    return 0
+}
+
+stop_managed_job() {
+    local remove_rc
+
+    inspect_job_or_fail || return 1
+    if [[ "$JOB_QUERY" == "absent" ]]; then
+        return 0
+    fi
+    if [[ "$JOB_QUERY" != "present" || "$JOB_VALID" != "1" ]]; then
+        fail "refusing to remove a launchd job whose identity is not safely recognized"
+        return 1
+    fi
+
+    launchctl_remove_job >/dev/null 2>&1
+    remove_rc=$?
+    if wait_for_job_absent; then
+        return 0
+    fi
+    fail "launchd did not remove the managed caffeinate job (remove status $remove_rc)"
+    return 1
+}
+
+start_managed_job() {
+    local mode
+    local submit_rc
+
+    mode="$1"
+    inspect_job_or_fail || return 1
+    if [[ "$JOB_QUERY" != "absent" ]]; then
+        fail "cannot submit the managed job because its label is already present"
+        return 1
+    fi
+
+    launchctl_submit_job "$mode" >/dev/null 2>&1
+    submit_rc=$?
+    if wait_for_job_mode "$mode"; then
+        return 0
+    fi
+    fail "launchd did not start caffeinate in $mode mode (submit status $submit_rc)"
+    return 1
+}
+
+configure_managed_job() {
+    local desired_mode
+
+    desired_mode="$1"
+    inspect_job_or_fail || return 1
+
+    if [[ "$JOB_QUERY" == "present" && "$JOB_VALID" != "1" ]]; then
+        fail "the no-sleep launchd label is occupied by an unrecognized job"
+        return 1
+    fi
+    if [[ "$JOB_QUERY" == "present" \
+        && "$JOB_RUNNING" == "1" \
+        && "$JOB_MODE" == "$desired_mode" ]]; then
+        return 0
+    fi
+    if [[ "$JOB_QUERY" == "present" ]]; then
+        stop_managed_job || return 1
+    fi
+    start_managed_job "$desired_mode"
+}
+
+snapshot_transaction_state() {
+    TX_HAD_STATE="$1"
+    TX_PRIOR_JOB_PRESENT="0"
+    TX_PRIOR_JOB_MODE=""
+    TX_PMSET_WRITE_ATTEMPTED="0"
+
+    if [[ "$TX_HAD_STATE" == "1" ]]; then
+        TX_OLD_PHASE="$STATE_PHASE"
+        TX_OLD_MODE="$STATE_MODE"
+        TX_OLD_PREVIOUS="$STATE_PREVIOUS_SLEEP_DISABLED"
+        TX_OLD_CHANGED="$STATE_PMSET_CHANGED"
+        TX_OLD_ENABLED_AT="$STATE_ENABLED_AT"
+    else
+        TX_OLD_PHASE=""
+        TX_OLD_MODE=""
+        TX_OLD_PREVIOUS=""
+        TX_OLD_CHANGED=""
+        TX_OLD_ENABLED_AT=""
+    fi
+
+    inspect_job || return 1
+    if [[ "$JOB_QUERY" == "present" ]]; then
+        if [[ "$JOB_VALID" != "1" ]]; then
+            return 1
+        fi
+        TX_PRIOR_JOB_PRESENT="1"
+        TX_PRIOR_JOB_MODE="$JOB_MODE"
+    elif [[ "$JOB_QUERY" != "absent" ]]; then
+        return 1
+    fi
+    return 0
+}
+
+restore_prior_job() {
+    if [[ "$TX_PRIOR_JOB_PRESENT" == "1" ]]; then
+        configure_managed_job "$TX_PRIOR_JOB_MODE"
+    else
+        stop_managed_job
+    fi
+}
+
+rollback_enable() {
+    local rollback_ok
+
+    rollback_ok="1"
+
+    if [[ "$TX_PMSET_WRITE_ATTEMPTED" == "1" ]]; then
+        if ! verify_sleep_disabled "$TX_PMSET_BEFORE"; then
+            sudo_write_sleep_disabled "$TX_PMSET_BEFORE" >/dev/null 2>&1
+            if ! verify_sleep_disabled "$TX_PMSET_BEFORE"; then
+                rollback_ok="0"
+            fi
+        fi
+    fi
+
+    if ! restore_prior_job; then
+        rollback_ok="0"
+    fi
+
+    if [[ "$rollback_ok" == "1" ]]; then
+        if [[ "$TX_HAD_STATE" == "1" ]]; then
+            write_state \
+                "$TX_OLD_PHASE" "$TX_OLD_MODE" "$TX_OLD_PREVIOUS" \
+                "$TX_OLD_CHANGED" "$TX_OLD_ENABLED_AT" || rollback_ok="0"
+        else
+            remove_state || rollback_ok="0"
+        fi
+    fi
+
+    if [[ "$rollback_ok" != "1" ]]; then
+        warn "enable rollback was incomplete; ownership state was retained for recovery"
+        return 1
+    fi
+    return 0
+}
+
+do_on() {
+    local desired_mode
+    local load_rc
+    local had_state
+    local previous
+    local changed
+    local enabled_at
+    local needs_pmset_write
+
+    desired_mode="$1"
+
+    load_state
+    load_rc=$?
+    case "$load_rc" in
+        0) had_state="1" ;;
+        1) had_state="0" ;;
+        *)
+            fail "ownership state is corrupt or unsafe; use 'no-sleep off --force' for explicit recovery"
+            return 2
+            ;;
+    esac
+
+    inspect_job || {
+        fail "cannot query the no-sleep launchd job"
+        return 2
+    }
+    if [[ "$JOB_QUERY" == "present" && "$JOB_VALID" != "1" ]]; then
+        fail "the no-sleep launchd label is occupied by an unrecognized job"
+        return 2
+    fi
+    if [[ "$had_state" == "0" && "$JOB_QUERY" == "present" ]]; then
+        fail "a no-sleep launchd job exists without ownership state; run 'no-sleep off --force' first"
+        return 2
+    fi
+
+    require_consistent_sleep_pair || return 2
+    TX_PMSET_BEFORE="$SLEEP_PERSISTENT"
+
+    if [[ "$had_state" == "1" ]]; then
+        previous="$STATE_PREVIOUS_SLEEP_DISABLED"
+        changed="$STATE_PMSET_CHANGED"
+        enabled_at="$STATE_ENABLED_AT"
+    else
+        previous="$SLEEP_PERSISTENT"
+        if [[ "$previous" == "0" ]]; then
+            changed="true"
+        else
+            changed="false"
+        fi
+        enabled_at=$(now_utc) || {
+            fail "cannot timestamp ownership state"
+            return 1
+        }
+    fi
+
+    needs_pmset_write="0"
+    if [[ "$SLEEP_PERSISTENT" != "1" ]]; then
+        if [[ "$had_state" == "1" && "$changed" != "true" ]]; then
+            fail "SleepDisabled changed externally; run 'no-sleep off', then enable again to establish a new baseline"
+            return 2
+        fi
+        needs_pmset_write="1"
+    fi
+
+    warn "sleep will be disabled system-wide; a closed Mac can drain its battery or heat up in a bag"
+    if [[ "$needs_pmset_write" == "1" ]]; then
+        require_sudo_authorization || return 1
+    fi
+
+    snapshot_transaction_state "$had_state" || {
+        fail "cannot safely snapshot the existing launchd job"
+        return 2
+    }
+
+    if ! write_state "enabling" "$desired_mode" "$previous" "$changed" "$enabled_at"; then
+        return 1
+    fi
+
+    if ! configure_managed_job "$desired_mode"; then
+        rollback_enable
+        return 2
+    fi
+
+    if [[ "$needs_pmset_write" == "1" ]]; then
+        TX_PMSET_WRITE_ATTEMPTED="1"
+        if ! apply_sleep_disabled "1"; then
+            rollback_enable
+            return 2
+        fi
+    elif ! verify_sleep_disabled "1"; then
+        fail "SleepDisabled stopped matching the requested on state"
+        rollback_enable
+        return 2
+    fi
+
+    if ! write_state "enabled" "$desired_mode" "$previous" "$changed" "$enabled_at"; then
+        warn "sleep prevention is active, but final state recording failed; status will report degraded"
+        return 2
+    fi
+
+    say "no-sleep: on ($(mode_label "$desired_mode"))"
+    if [[ "$changed" == "true" ]]; then
+        say "SleepDisabled: 1 (managed; previous 0)"
+    else
+        say "SleepDisabled: 1 (pre-existing; will be preserved on off)"
+    fi
+    return 0
+}
+
+do_off_without_valid_state() {
+    local force
+    local corrupt_state
+    local job_safe_to_remove
+
+    force="$1"
+    corrupt_state="$2"
+
+    job_safe_to_remove="1"
+    job_is_safe_to_remove "" || job_safe_to_remove="0"
+
+    require_consistent_sleep_pair || return 2
+
+    if [[ "$force" == "1" ]]; then
+        if [[ "$corrupt_state" == "1" ]]; then
+            state_file_is_safe
+            if [[ "$?" -eq 2 ]]; then
+                fail "the corrupt state path is unsafe; refusing forced recovery"
+                return 2
+            fi
+        fi
+        if [[ "$SLEEP_PERSISTENT" != "0" ]]; then
+            require_sudo_authorization || return 1
+            if ! apply_sleep_disabled "0"; then
+                return 2
+            fi
+        fi
+    fi
+
+    if [[ "$JOB_QUERY" == "present" ]]; then
+        if [[ "$job_safe_to_remove" != "1" ]]; then
+            if [[ "$corrupt_state" == "1" && "$force" == "1" ]]; then
+                remove_state || return 2
+            fi
+            warn "the pmset layer was handled, but the unrecognized launchd job was left untouched"
+            return 2
+        fi
+        if ! stop_managed_job; then
+            return 2
+        fi
+    elif [[ "$JOB_QUERY" != "absent" ]]; then
+        warn "the pmset layer was handled, but launchd state remains unknown"
+        return 2
+    fi
+
+    if [[ "$force" == "1" ]] && ! verify_sleep_disabled "0"; then
+        warn "SleepDisabled drifted during forced recovery"
+        return 2
+    fi
+
+    if [[ "$corrupt_state" == "1" ]]; then
+        if [[ "$force" == "1" ]]; then
+            remove_state || return 2
+        else
+            warn "caffeinate was stopped, but corrupt ownership state and pmset were left untouched"
+            warn "run 'no-sleep off --force' to explicitly restore SleepDisabled=0"
+            return 2
+        fi
+    fi
+
+    if [[ "$force" != "1" && "$SLEEP_PERSISTENT" == "1" ]]; then
+        say "no-sleep: off (managed job absent)"
+        warn "SleepDisabled is still 1 with no ownership record; use 'no-sleep off --force' to clear it"
+        return 2
+    else
+        say "no-sleep: off"
+    fi
+    return 0
+}
+
+do_off() {
+    local force
+    local load_rc
+    local target
+    local needs_pmset_write
+    local job_safe_to_remove
+
+    force="$1"
+
+    load_state
+    load_rc=$?
+    case "$load_rc" in
+        1) do_off_without_valid_state "$force" "0"; return $? ;;
+        2) do_off_without_valid_state "$force" "1"; return $? ;;
+    esac
+
+    job_safe_to_remove="1"
+    job_is_safe_to_remove "; pmset restoration will still be attempted" \
+        || job_safe_to_remove="0"
+    require_consistent_sleep_pair || return 2
+
+    needs_pmset_write="0"
+    target="$SLEEP_PERSISTENT"
+    if [[ "$STATE_PMSET_CHANGED" == "true" ]]; then
+        target="$STATE_PREVIOUS_SLEEP_DISABLED"
+        if [[ "$SLEEP_PERSISTENT" != "$target" ]]; then
+            needs_pmset_write="1"
+            require_sudo_authorization || return 1
+        fi
+    fi
+
+    if ! write_state \
+        "disabling" "$STATE_MODE" "$STATE_PREVIOUS_SLEEP_DISABLED" \
+        "$STATE_PMSET_CHANGED" "$STATE_ENABLED_AT"; then
+        return 1
+    fi
+
+    if [[ "$needs_pmset_write" == "1" ]]; then
+        if ! apply_sleep_disabled "$target"; then
+            warn "caffeinate remains active because pmset restoration failed"
+            return 2
+        fi
+    elif [[ "$STATE_PMSET_CHANGED" == "true" ]] && ! verify_sleep_disabled "$target"; then
+        fail "SleepDisabled does not match the recorded baseline"
+        return 2
+    fi
+
+    if [[ "$job_safe_to_remove" != "1" ]]; then
+        warn "SleepDisabled was restored, but the unrecognized launchd job was left untouched"
+        return 2
+    fi
+    if ! stop_managed_job; then
+        warn "SleepDisabled was restored, but the managed caffeinate job could not be removed"
+        return 2
+    fi
+    if [[ "$STATE_PMSET_CHANGED" == "true" ]] && ! verify_sleep_disabled "$target"; then
+        warn "SleepDisabled drifted after caffeinate stopped; ownership state was retained"
+        return 2
+    fi
+    remove_state || return 2
+
+    say "no-sleep: off"
+    if [[ "$STATE_PMSET_CHANGED" == "false" && "$SLEEP_PERSISTENT" == "1" ]]; then
+        say "SleepDisabled: 1 (preserved pre-existing setting)"
+    else
+        say "SleepDisabled: $target"
+    fi
+    return 0
+}
+
+print_status_details() {
+    local state_rc
+
+    state_rc="$1"
+    if [[ "$state_rc" -eq 0 ]]; then
+        say "mode: $(mode_label "$STATE_MODE")"
+        say "journal: $STATE_PHASE (baseline $STATE_PREVIOUS_SLEEP_DISABLED, changed $STATE_PMSET_CHANGED)"
+    elif [[ "$state_rc" -eq 1 ]]; then
+        say "journal: absent"
+    else
+        say "journal: corrupt or unsafe"
+    fi
+
+    if [[ "$JOB_QUERY" == "absent" ]]; then
+        say "caffeinate: stopped"
+    elif [[ "$JOB_QUERY" == "present" && "$JOB_VALID" == "1" && "$JOB_RUNNING" == "1" ]]; then
+        say "caffeinate: running (pid $JOB_PID, mode $JOB_MODE)"
+    elif [[ "$JOB_QUERY" == "present" ]]; then
+        say "caffeinate: degraded (${JOB_DIAGNOSTIC:-unrecognized job})"
+    else
+        say "caffeinate: unknown (${JOB_DIAGNOSTIC:-launchctl query failed})"
+    fi
+
+    if [[ -n "$SLEEP_PERSISTENT" && -n "$SLEEP_LIVE" ]]; then
+        say "SleepDisabled: persistent $SLEEP_PERSISTENT, live $SLEEP_LIVE"
+    else
+        say "SleepDisabled: unknown"
+    fi
+}
+
+do_status() {
+    local state_rc
+    local pair_ok
+
+    load_state
+    state_rc=$?
+    inspect_job
+    read_sleep_pair_once
+    pair_ok=$?
+
+    if [[ "$state_rc" -eq 0 \
+        && "$STATE_PHASE" == "enabled" \
+        && "$JOB_QUERY" == "present" \
+        && "$JOB_VALID" == "1" \
+        && "$JOB_RUNNING" == "1" \
+        && "$JOB_MODE" == "$STATE_MODE" \
+        && "$pair_ok" -eq 0 \
+        && "$SLEEP_PERSISTENT" == "1" \
+        && "$SLEEP_LIVE" == "1" ]]; then
+        say "no-sleep: on"
+        print_status_details "$state_rc"
+        return 0
+    fi
+
+    if [[ "$state_rc" -eq 1 \
+        && "$JOB_QUERY" == "absent" \
+        && "$pair_ok" -eq 0 \
+        && "$SLEEP_PERSISTENT" == "0" \
+        && "$SLEEP_LIVE" == "0" ]]; then
+        say "no-sleep: off"
+        print_status_details "$state_rc"
+        return 1
+    fi
+
+    say "no-sleep: degraded"
+    print_status_details "$state_rc"
+    if [[ "$state_rc" -eq 0 && "$JOB_QUERY" == "absent" && "$SLEEP_PERSISTENT" == "1" ]]; then
+        say "recovery: run 'no-sleep on' to resume this session or 'no-sleep off' to restore sleep"
+    elif [[ "$state_rc" -eq 2 ]]; then
+        say "recovery: inspect the journal, then use 'no-sleep off --force' if SleepDisabled should be cleared"
+    elif [[ "$state_rc" -eq 1 && "$SLEEP_PERSISTENT" == "1" ]]; then
+        say "recovery: SleepDisabled is unowned; use 'no-sleep off --force' only if it should be cleared"
+    fi
+    return 2
+}
+
+do_toggle() {
+    local desired_mode
+    local state_rc
+
+    desired_mode="$1"
+    load_state
+    state_rc=$?
+    if [[ "$state_rc" -eq 0 || "$state_rc" -eq 2 ]]; then
+        do_off "0"
+        return $?
+    fi
+
+    inspect_job || return 2
+    if [[ "$JOB_QUERY" == "present" ]]; then
+        do_off "0"
+    else
+        require_consistent_sleep_pair || return 2
+        if [[ "$SLEEP_PERSISTENT" == "1" ]]; then
+            fail "SleepDisabled is unowned; use 'no-sleep on' to adopt it or 'no-sleep off --force' to clear it"
+            return 2
+        fi
+        do_on "$desired_mode"
+    fi
+}
+
+# Accepts either no option or one specific flag, echoing the value that the
+# presence or absence of that flag selects.
+parse_optional_flag() {
+    local flag
+    local present
+    local absent
+
+    flag="$1"
+    present="$2"
+    absent="$3"
+    shift 3
+
+    if [[ "$#" -eq 0 ]]; then
+        printf '%s\n' "$absent"
+        return 0
+    fi
+    if [[ "$#" -eq 1 && "$1" == "$flag" ]]; then
+        printf '%s\n' "$present"
+        return 0
+    fi
+    fail "expected no option or $flag"
+    return 64
+}
+
+parse_mode_flag() {
+    parse_optional_flag --display display system "$@"
+}
+
+parse_force_flag() {
+    parse_optional_flag --force 1 0 "$@"
+}
+
+main() {
+    local command
+    local mode
+    local force
+
+    preflight || return 1
+
+    command="${1:-status}"
+    if [[ "$#" -gt 0 ]]; then
+        shift
+    fi
+
+    case "$command" in
+        status|help|-h|--help|version|--version)
+            if [[ "$#" -ne 0 ]]; then
+                fail "$command does not accept arguments"
+                return 64
+            fi
+            ;;
+    esac
+
+    case "$command" in
+        status)
+            do_status
+            ;;
+        on|enable)
+            mode=$(parse_mode_flag "$@") || return $?
+            with_operation_lock do_on "$mode"
+            ;;
+        off|disable)
+            force=$(parse_force_flag "$@") || return $?
+            with_operation_lock do_off "$force"
+            ;;
+        toggle)
+            mode=$(parse_mode_flag "$@") || return $?
+            with_operation_lock do_toggle "$mode"
+            ;;
+        help|-h|--help)
+            usage
+            ;;
+        version|--version)
+            say "$PROGRAM_NAME $PROGRAM_VERSION"
+            ;;
+        *)
+            fail "unknown command: $command"
+            usage >&2
+            return 64
+            ;;
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
