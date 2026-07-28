@@ -16,6 +16,13 @@ Because layer two outlives layer one, the tool keeps an **ownership journal** at
 `~/.local/state/no-sleep/state.plist` recording whether *it* changed `SleepDisabled` and what the
 value was before. Nearly all of the code's complexity exists to keep that journal honest.
 
+A separate, optional **menu bar app** lives in `app/` (`main.swift`, compiled with `swiftc` via
+`make build-app`; `make install-app` copies `NoSleep.app` to `~/Applications` and registers the
+`com.callmemorgan.no-sleep.menubar` LaunchAgent). It is read-only against the CLI: it polls
+`no-sleep status` (exit codes 0/1/2) to pick an SF Symbol icon, and its on/off menu actions launch
+Terminal so the CLI's sudo prompt still has a TTY. It has no tests and no signing; keep it that
+simple unless it grows real logic.
+
 ## Commands
 
 ```sh

@@ -11,7 +11,7 @@ REFUSE_ROOT = @if [[ "$${EUID}" -eq 0 ]]; then \
 		exit 1; \
 	fi
 
-.PHONY: all install uninstall test check
+.PHONY: all install uninstall test check build-app install-app uninstall-app
 
 all: check
 
@@ -44,3 +44,34 @@ check:
 
 test: check
 	/bin/bash tests/test-no-sleep.sh
+
+# Menu bar companion app (app/main.swift, unsigned, built locally with swiftc).
+APP_NAME := NoSleep
+BUILD_DIR := build
+APP_BUILT := $(BUILD_DIR)/$(APP_NAME).app
+APP_DIR ?= $(HOME)/Applications
+APP_INSTALLED := $(APP_DIR)/$(APP_NAME).app
+AGENT_LABEL := com.callmemorgan.no-sleep.menubar
+AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_LABEL).plist
+
+build-app:
+	/usr/bin/install -d "$(APP_BUILT)/Contents/MacOS"
+	/usr/bin/xcrun swiftc -O -o "$(APP_BUILT)/Contents/MacOS/$(APP_NAME)" app/main.swift
+	/usr/bin/install -m 0644 app/Info.plist "$(APP_BUILT)/Contents/Info.plist"
+	@echo "Built $(APP_BUILT)"
+
+install-app: build-app
+	$(REFUSE_ROOT)
+	/usr/bin/install -d -m 0755 "$(APP_DIR)" "$(HOME)/Library/LaunchAgents"
+	/usr/bin/ditto "$(APP_BUILT)" "$(APP_INSTALLED)"
+	/usr/bin/sed -e "s|__HOME__|$(HOME)|g" "app/$(AGENT_LABEL).plist" > "$(AGENT_PLIST)"
+	-/bin/launchctl bootout "gui/$$(id -u)/$(AGENT_LABEL)"
+	/bin/launchctl bootstrap "gui/$$(id -u)" "$(AGENT_PLIST)"
+	@echo "Installed $(APP_INSTALLED) and started $(AGENT_LABEL)"
+
+uninstall-app:
+	$(REFUSE_ROOT)
+	-/bin/launchctl bootout "gui/$$(id -u)/$(AGENT_LABEL)"
+	/bin/rm -f "$(AGENT_PLIST)"
+	/bin/rm -rf "$(APP_INSTALLED)"
+	@echo "Removed $(APP_INSTALLED) and $(AGENT_LABEL)"
