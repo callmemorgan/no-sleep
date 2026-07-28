@@ -6,6 +6,11 @@
 # dialog exits non-zero so sudo reports a failed authorization.
 set -u
 
+# The dialog is displayed from an activated app, otherwise it can open behind
+# the frontmost window while sudo silently waits here for a password.
 exec /usr/bin/osascript \
+    -e 'tell application "System Events"' \
+    -e 'activate' \
     -e 'display dialog "no-sleep needs your administrator password to change the system power setting." default answer "" with hidden answer with title "no-sleep" buttons {"Cancel", "OK"} default button "OK" cancel button "Cancel"' \
+    -e 'end tell' \
     -e 'text returned of result' 2>/dev/null
