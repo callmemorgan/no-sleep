@@ -587,8 +587,19 @@ verify_sleep_disabled() {
     retry_until 20 sleep_pair_is "$1"
 }
 
+# sudo prompts on the invoking TTY by default. When stdin is not a TTY (the
+# menu bar app runs the CLI headlessly) and SUDO_ASKPASS is set, -A routes the
+# prompt through the askpass helper instead.
+sudo_needs_askpass() {
+    [[ -n "${SUDO_ASKPASS:-}" && ! -t 0 ]]
+}
+
 sudo_authorize() {
-    "$SUDO_BIN" -v
+    if sudo_needs_askpass; then
+        "$SUDO_BIN" -A -v
+    else
+        "$SUDO_BIN" -v
+    fi
 }
 
 require_sudo_authorization() {
@@ -602,7 +613,11 @@ invoke_sudo_pmset() {
 
     value="$1"
     case "$value" in 0|1) ;; *) return 64 ;; esac
-    "$SUDO_BIN" -- "$PMSET_BIN" -a disablesleep "$value"
+    if sudo_needs_askpass; then
+        "$SUDO_BIN" -A -- "$PMSET_BIN" -a disablesleep "$value"
+    else
+        "$SUDO_BIN" -- "$PMSET_BIN" -a disablesleep "$value"
+    fi
 }
 
 sudo_write_sleep_disabled() {

@@ -456,12 +456,20 @@ test_privileged_command_contract() {
     export NO_SLEEP_TEST_SUDO_CAPTURE="$capture"
     SUDO_BIN="$fake_sudo"
 
-    invoke_sudo_pmset "1"
+    # Without SUDO_ASKPASS there is no -A, whether or not stdin is a terminal.
+    ( unset SUDO_ASKPASS; invoke_sudo_pmset "1" )
     assert_file_value "$capture" "$(printf '%s\n' \
         "--" "$PMSET_BIN" "-a" "disablesleep" "1")"
 
+    # With SUDO_ASKPASS set and no TTY on stdin (the menu bar app's case),
+    # sudo is asked to use the askpass helper instead of prompting.
     : >"$capture"
-    if invoke_sudo_pmset "invalid"; then
+    ( SUDO_ASKPASS="$(fake_path "askpass")"; export SUDO_ASKPASS; invoke_sudo_pmset "1" ) </dev/null
+    assert_file_value "$capture" "$(printf '%s\n' \
+        "-A" "--" "$PMSET_BIN" "-a" "disablesleep" "1")"
+
+    : >"$capture"
+    if ( unset SUDO_ASKPASS; invoke_sudo_pmset "invalid" ); then
         printf 'invalid pmset value should be rejected\n' >&2
         return 1
     fi

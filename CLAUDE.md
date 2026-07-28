@@ -22,10 +22,12 @@ hardened runtime + timestamp; `CODESIGN_IDENTITY` overrides the partial-name mat
 `NoSleep.app` to `~/Applications`, and registers the
 `com.callmemorgan.no-sleep.menubar` LaunchAgent). `make notarize-app` submits to Apple's notary
 service and staples the ticket, but needs a one-time interactive
-`xcrun notarytool store-credentials` first. The app is read-only against the CLI: it polls
-`no-sleep status` (exit codes 0/1/2) to pick an SF Symbol icon, and its on/off menu actions launch
-Terminal so the CLI's sudo prompt still has a TTY. It has no tests; keep it that simple unless it
-grows real logic.
+`xcrun notarytool store-credentials` first. The app polls `no-sleep status` (exit codes 0/1/2) to
+pick an SF Symbol icon. Its on/off menu actions run the CLI directly with `SUDO_ASKPASS` pointing
+at the bundled `no-sleep-askpass` helper (a GUI password dialog), because the app has no TTY for
+sudo to prompt on; `bin/no-sleep` adds `-A` to its sudo calls exactly when stdin is not a TTY and
+`SUDO_ASKPASS` is set (`sudo_needs_askpass`). It has no tests; keep it that simple unless it grows
+real logic.
 
 ## Commands
 
