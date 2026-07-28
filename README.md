@@ -53,9 +53,10 @@ the local Developer ID identity (hardened runtime, secure timestamp), copies
 it to `~/Applications`, and registers a LaunchAgent so it starts at login.
 Set `CODESIGN_IDENTITY` to a full identity string if several Developer ID
 certificates are present. The icon polls `no-sleep status` every few seconds
-and never prompts for a password. The menu's on/off actions open a Terminal
-window running the CLI, because transitions can legitimately require a sudo
-password on a real TTY.
+and never prompts for a password. The menu's on/off actions run the CLI
+directly; if a transition needs administrator authorization, sudo prompts
+through a GUI password dialog (the bundled `no-sleep-askpass` helper, wired
+up via `SUDO_ASKPASS`) and failures surface in an alert.
 
 The app is signed but not notarized, which is enough for local use. To make
 Gatekeeper accept it on other machines, store notarization credentials once

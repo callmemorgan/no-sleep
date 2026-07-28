@@ -39,8 +39,8 @@ SHELLCHECK ?= $(shell command -v shellcheck 2>/dev/null || echo /opt/homebrew/bi
 
 check:
 	/bin/test -x bin/no-sleep
-	/bin/bash -n bin/no-sleep
-	$(SHELLCHECK) -x -s bash bin/no-sleep tests/test-no-sleep.sh
+	/bin/bash -n bin/no-sleep app/askpass.sh
+	$(SHELLCHECK) -x -s bash bin/no-sleep tests/test-no-sleep.sh app/askpass.sh
 
 test: check
 	/bin/bash tests/test-no-sleep.sh
@@ -59,9 +59,10 @@ AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_LABEL).plist
 CODESIGN_IDENTITY ?= Developer ID Application
 
 build-app:
-	/usr/bin/install -d "$(APP_BUILT)/Contents/MacOS"
+	/usr/bin/install -d "$(APP_BUILT)/Contents/MacOS" "$(APP_BUILT)/Contents/Resources"
 	/usr/bin/xcrun swiftc -O -o "$(APP_BUILT)/Contents/MacOS/$(APP_NAME)" app/main.swift
 	/usr/bin/install -m 0644 app/Info.plist "$(APP_BUILT)/Contents/Info.plist"
+	/usr/bin/install -m 0755 app/askpass.sh "$(APP_BUILT)/Contents/Resources/no-sleep-askpass"
 	@echo "Built $(APP_BUILT)"
 
 # Hardened runtime with a secure timestamp, matching what notarization would
