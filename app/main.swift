@@ -81,8 +81,6 @@ final class StatusBarController: NSObject {
 
     override init() {
         super.init()
-        UNUserNotificationCenter.current().delegate = self
-        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         let menu = NSMenu()
         menu.delegate = self
         statusItem.menu = menu
@@ -140,20 +138,25 @@ final class StatusBarController: NSObject {
     // bundled helper that shows a GUI password dialog. Failures surface in
     // an alert with the CLI's own output; success is reflected by the icon.
     private func runCLI(_ argument: String) {
-        guard let cliPath,
-              let askpass = Bundle.main.path(forResource: "no-sleep-askpass", ofType: nil) else {
+        guard let cliPath else { return }
+        guard let askpass = Bundle.main.path(forResource: "no-sleep-askpass", ofType: nil) else {
+            showFailure("this NoSleep.app has no bundled no-sleep-askpass helper, "
+                + "so it cannot ask for the administrator password; reinstall it with: make install-app")
             return
         }
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
             let output = Pipe()
+            let errorOutput = Pipe()
             process.executableURL = URL(fileURLWithPath: cliPath)
             process.arguments = [argument]
             var environment = ProcessInfo.processInfo.environment
             environment["SUDO_ASKPASS"] = askpass
             process.environment = environment
+            // Separate pipes: stdout carries the result line, stderr carries
+            // warnings the CLI emits first (which must not be mistaken for it).
             process.standardOutput = output
-            process.standardError = output
+            process.standardError = errorOutput
             do {
                 try process.run()
             } catch {
@@ -162,9 +165,22 @@ final class StatusBarController: NSObject {
                 }
                 return
             }
-            process.waitUntilExit()
+            // Drain both pipes before waiting, and drain them concurrently:
+            // a child that fills either pipe buffer blocks until it is read,
+            // so waiting first (or reading one to EOF first) can deadlock.
+            var errorData = Data()
+            let draining = DispatchGroup()
+            draining.enter()
+            DispatchQueue.global(qos: .userInitiated).async {
+                errorData = errorOutput.fileHandleForReading.readDataToEndOfFile()
+                draining.leave()
+            }
             let data = output.fileHandleForReading.readDataToEndOfFile()
+            draining.wait()
+            process.waitUntilExit()
             let text = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let errorText = String(data: errorData, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             let status = process.terminationStatus
             DispatchQueue.main.async {
@@ -173,19 +189,45 @@ final class StatusBarController: NSObject {
                     let firstLine = text.split(separator: "\n").first.map(String.init)
                     self.notify(firstLine ?? "no-sleep \(argument) succeeded")
                 } else {
-                    self.showFailure(text.isEmpty ? "no-sleep \(argument) exited with status \(status)" : text)
+                    let detail = [errorText, text].filter { !$0.isEmpty }.joined(separator: "\n")
+                    self.showFailure(detail.isEmpty
+                        ? "no-sleep \(argument) exited with status \(status)"
+                        : detail)
                 }
             }
         }
     }
 
     // Transient success confirmation; failures use the modal alert instead.
+    // The notification center is resolved lazily here rather than in init, so
+    // the status item works even where the API is unavailable, and a denied
+    // authorization falls back to the menu bar so a transition is never silent.
     private func notify(_ body: String) {
-        let content = UNMutableNotificationContent()
-        content.title = "no-sleep"
-        content.body = body
-        let request = UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil)
-        UNUserNotificationCenter.current().add(request)
+        let center = UNUserNotificationCenter.current()
+        center.delegate = self
+        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
+            guard granted else {
+                DispatchQueue.main.async { self.flashInMenuBar(body) }
+                return
+            }
+            let content = UNMutableNotificationContent()
+            content.title = "no-sleep"
+            content.body = body
+            let request = UNNotificationRequest(identifier: UUID().uuidString,
+                                                content: content,
+                                                trigger: nil)
+            center.add(request)
+        }
+    }
+
+    // Visible fallback when notifications are not authorized: show the result
+    // beside the icon for a few seconds.
+    private func flashInMenuBar(_ body: String) {
+        guard let button = statusItem.button else { return }
+        button.title = " " + body
+        Timer.scheduledTimer(withTimeInterval: 4, repeats: false) { [weak self] _ in
+            self?.statusItem.button?.title = ""
+        }
     }
 
     private func showFailure(_ message: String) {
