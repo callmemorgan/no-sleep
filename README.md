@@ -35,6 +35,43 @@ the system-wide `SleepDisabled` value. `status` never prompts.
 `--display` changes the caffeinate assertion from `-i` to `-d -i`. Running
 `on` again without the flag returns to system-only mode.
 
+## Menu bar indicator
+
+A small menu bar app mirrors the state so you can tell at a glance
+whether sleep prevention is active:
+
+- filled cup: on;
+- outline cup: off;
+- warning triangle: degraded (for example, after a logout or reboot).
+
+```sh
+make install-app
+```
+
+This builds `NoSleep.app` from `app/main.swift` with `swiftc`, signs it with
+the local Developer ID identity (hardened runtime, secure timestamp), copies
+it to `~/Applications`, and registers a LaunchAgent so it starts at login.
+Set `CODESIGN_IDENTITY` to a full identity string if several Developer ID
+certificates are present. The icon polls `no-sleep status` every few seconds
+and never prompts for a password. The menu's on/off actions open a Terminal
+window running the CLI, because transitions can legitimately require a sudo
+password on a real TTY.
+
+The app is signed but not notarized, which is enough for local use. To make
+Gatekeeper accept it on other machines, store notarization credentials once
+(this needs an app-specific password from appleid.apple.com):
+
+```sh
+xcrun notarytool store-credentials notarytool
+make notarize-app   # submit, wait, staple; then make install-app
+```
+
+Remove it with:
+
+```sh
+make uninstall-app
+```
+
 ## Lifecycle and recovery
 
 The caffeinate job belongs to the current login session. Logging out or
