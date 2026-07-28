@@ -74,7 +74,7 @@ func queryStatus(cliPath: String?) -> StatusSnapshot {
 
 final class StatusBarController: NSObject {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-    private let cliPath = findCLI()
+    private var cliPath = findCLI()
     private var snapshot = StatusSnapshot(state: .degraded, summary: "no-sleep: checking…")
     private var refreshing = false
 
@@ -114,6 +114,9 @@ final class StatusBarController: NSObject {
     @objc private func refresh() {
         guard !refreshing else { return }
         refreshing = true
+        // Re-resolve on every poll: the CLI may have been installed (or
+        // removed) after the app launched.
+        cliPath = findCLI()
         let path = cliPath
         DispatchQueue.global(qos: .utility).async {
             let result = queryStatus(cliPath: path)

@@ -91,7 +91,8 @@ install-app: sign-app
 	$(REFUSE_ROOT)
 	/usr/bin/install -d -m 0755 "$(APP_DIR)" "$(HOME)/Library/LaunchAgents"
 	/usr/bin/ditto "$(APP_BUILT)" "$(APP_INSTALLED)"
-	/usr/bin/sed -e "s|__HOME__|$(HOME)|g" "app/$(AGENT_LABEL).plist" > "$(AGENT_PLIST)"
+	/usr/bin/sed -e "s|__APP_PATH__|$(APP_INSTALLED)/Contents/MacOS/$(APP_NAME)|g" \
+		"app/$(AGENT_LABEL).plist" > "$(AGENT_PLIST)"
 	-/bin/launchctl bootout "gui/$$(id -u)/$(AGENT_LABEL)"
 	/bin/launchctl bootstrap "gui/$$(id -u)" "$(AGENT_PLIST)"
 	@echo "Installed $(APP_INSTALLED) and started $(AGENT_LABEL)"
