@@ -37,7 +37,7 @@ the system-wide `SleepDisabled` value. `status` never prompts.
 
 ## Menu bar indicator
 
-A small unsigned menu bar app mirrors the state so you can tell at a glance
+A small menu bar app mirrors the state so you can tell at a glance
 whether sleep prevention is active:
 
 - filled cup: on;
@@ -48,11 +48,23 @@ whether sleep prevention is active:
 make install-app
 ```
 
-This builds `NoSleep.app` from `app/main.swift` with `swiftc`, copies it to
-`~/Applications`, and registers a LaunchAgent so it starts at login. The icon
-polls `no-sleep status` every few seconds and never prompts for a password.
-The menu's on/off actions open a Terminal window running the CLI, because
-transitions can legitimately require a sudo password on a real TTY.
+This builds `NoSleep.app` from `app/main.swift` with `swiftc`, signs it with
+the local Developer ID identity (hardened runtime, secure timestamp), copies
+it to `~/Applications`, and registers a LaunchAgent so it starts at login.
+Set `CODESIGN_IDENTITY` to a full identity string if several Developer ID
+certificates are present. The icon polls `no-sleep status` every few seconds
+and never prompts for a password. The menu's on/off actions open a Terminal
+window running the CLI, because transitions can legitimately require a sudo
+password on a real TTY.
+
+The app is signed but not notarized, which is enough for local use. To make
+Gatekeeper accept it on other machines, store notarization credentials once
+(this needs an app-specific password from appleid.apple.com):
+
+```sh
+xcrun notarytool store-credentials notarytool
+make notarize-app   # submit, wait, staple; then make install-app
+```
 
 Remove it with:
 
