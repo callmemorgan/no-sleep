@@ -56,7 +56,11 @@ certificates are present. The icon polls `no-sleep status` every few seconds
 and never prompts for a password. The menu's on/off actions run the CLI
 directly; if a transition needs administrator authorization, sudo prompts
 through a GUI password dialog (the bundled `no-sleep-askpass` helper, wired
-up via `SUDO_ASKPASS`) and failures surface in an alert.
+up via `SUDO_ASKPASS`) and failures surface in an alert. The menu's actions
+are state-aware: when prevention is off it offers to turn it on, with a
+display variant that passes `--display` to also keep the display awake; when
+on it offers to turn off, shows the current mode, and can switch a
+system-only session to display mode.
 
 The app is signed but not notarized, which is enough for local use. To make
 Gatekeeper accept it on other machines, store notarization credentials once

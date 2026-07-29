@@ -23,6 +23,9 @@ enum SleepState {
 struct StatusSnapshot {
     let state: SleepState
     let summary: String
+    // Value of the status output's "mode:" line ("system only" /
+    // "system + display"), when the CLI reported one.
+    let mode: String?
 }
 
 func findCLI() -> String? {
@@ -38,7 +41,7 @@ func findCLI() -> String? {
 
 func queryStatus(cliPath: String?) -> StatusSnapshot {
     guard let cliPath else {
-        return StatusSnapshot(state: .cliMissing, summary: "no-sleep CLI not found")
+        return StatusSnapshot(state: .cliMissing, summary: "no-sleep CLI not found", mode: nil)
     }
 
     let process = Process()
@@ -50,13 +53,16 @@ func queryStatus(cliPath: String?) -> StatusSnapshot {
     do {
         try process.run()
     } catch {
-        return StatusSnapshot(state: .degraded, summary: "no-sleep: failed to run status")
+        return StatusSnapshot(state: .degraded, summary: "no-sleep: failed to run status", mode: nil)
     }
     process.waitUntilExit()
 
     let data = output.fileHandleForReading.readDataToEndOfFile()
-    let firstLine = String(data: data, encoding: .utf8)?
-        .split(separator: "\n").first.map(String.init) ?? ""
+    let lines = String(data: data, encoding: .utf8)?
+        .split(separator: "\n").map(String.init) ?? []
+    let firstLine = lines.first ?? ""
+    let mode = lines.first(where: { $0.hasPrefix("mode: ") })
+        .map { String($0.dropFirst("mode: ".count)) }
     let fallback: String
     let state: SleepState
     switch process.terminationStatus {
@@ -70,13 +76,13 @@ func queryStatus(cliPath: String?) -> StatusSnapshot {
         state = .degraded
         fallback = "no-sleep: degraded"
     }
-    return StatusSnapshot(state: state, summary: firstLine.isEmpty ? fallback : firstLine)
+    return StatusSnapshot(state: state, summary: firstLine.isEmpty ? fallback : firstLine, mode: mode)
 }
 
 final class StatusBarController: NSObject {
     private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     private var cliPath = findCLI()
-    private var snapshot = StatusSnapshot(state: .degraded, summary: "no-sleep: checking…")
+    private var snapshot = StatusSnapshot(state: .degraded, summary: "no-sleep: checking…", mode: nil)
     private var refreshing = false
 
     override init() {
@@ -129,16 +135,18 @@ final class StatusBarController: NSObject {
         }
     }
 
-    @objc private func turnOn() { runCLI("on") }
-    @objc private func turnOff() { runCLI("off") }
+    @objc private func turnOn() { runCLI(["on"]) }
+    @objc private func turnOnDisplay() { runCLI(["on", "--display"]) }
+    @objc private func turnOff() { runCLI(["off"]) }
     @objc private func quit() { NSApp.terminate(nil) }
 
     // Runs the CLI directly. Power transitions may need administrator
     // authorization: with no TTY, sudo falls back to SUDO_ASKPASS, the
     // bundled helper that shows a GUI password dialog. Failures surface in
     // an alert with the CLI's own output; success is reflected by the icon.
-    private func runCLI(_ argument: String) {
+    private func runCLI(_ arguments: [String]) {
         guard let cliPath else { return }
+        let command = arguments.joined(separator: " ")
         guard let askpass = Bundle.main.path(forResource: "no-sleep-askpass", ofType: nil) else {
             showFailure("this NoSleep.app has no bundled no-sleep-askpass helper, "
                 + "so it cannot ask for the administrator password; reinstall it with: make install-app")
@@ -149,7 +157,7 @@ final class StatusBarController: NSObject {
             let output = Pipe()
             let errorOutput = Pipe()
             process.executableURL = URL(fileURLWithPath: cliPath)
-            process.arguments = [argument]
+            process.arguments = arguments
             var environment = ProcessInfo.processInfo.environment
             environment["SUDO_ASKPASS"] = askpass
             process.environment = environment
@@ -187,11 +195,11 @@ final class StatusBarController: NSObject {
                 self.refresh()
                 if status == 0 {
                     let firstLine = text.split(separator: "\n").first.map(String.init)
-                    self.notify(firstLine ?? "no-sleep \(argument) succeeded")
+                    self.notify(firstLine ?? "no-sleep \(command) succeeded")
                 } else {
                     let detail = [errorText, text].filter { !$0.isEmpty }.joined(separator: "\n")
                     self.showFailure(detail.isEmpty
-                        ? "no-sleep \(argument) exited with status \(status)"
+                        ? "no-sleep \(command) exited with status \(status)"
                         : detail)
                 }
             }
@@ -254,12 +262,33 @@ extension StatusBarController: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         addItem(to: menu, title: snapshot.summary, action: nil, enabled: false)
+        if snapshot.state == .on, let mode = snapshot.mode {
+            addItem(to: menu, title: "mode: \(mode)", action: nil, enabled: false)
+        }
         if snapshot.state == .cliMissing {
             addItem(to: menu, title: "install the CLI with: make install", action: nil, enabled: false)
         }
         menu.addItem(.separator())
-        addItem(to: menu, title: "Turn Sleep Prevention On", action: #selector(turnOn), enabled: cliPath != nil)
-        addItem(to: menu, title: "Turn Sleep Prevention Off", action: #selector(turnOff), enabled: cliPath != nil)
+        // On and off are consolidated by state: the poll already knows which
+        // transition applies, so only meaningful actions are offered. In the
+        // degraded/unknown states both stay available for recovery.
+        let cliAvailable = cliPath != nil
+        switch snapshot.state {
+        case .on:
+            addItem(to: menu, title: "Turn Sleep Prevention Off", action: #selector(turnOff), enabled: cliAvailable)
+            // `no-sleep on --display` also switches an active system-only
+            // session to display mode, so offer it unless already there.
+            if snapshot.mode != "system + display" {
+                addItem(to: menu, title: "Keep Display Awake Too", action: #selector(turnOnDisplay), enabled: cliAvailable)
+            }
+        case .off:
+            addItem(to: menu, title: "Turn Sleep Prevention On", action: #selector(turnOn), enabled: cliAvailable)
+            addItem(to: menu, title: "Turn On (Keep Display Awake)", action: #selector(turnOnDisplay), enabled: cliAvailable)
+        case .degraded, .cliMissing:
+            addItem(to: menu, title: "Turn Sleep Prevention On", action: #selector(turnOn), enabled: cliAvailable)
+            addItem(to: menu, title: "Turn On (Keep Display Awake)", action: #selector(turnOnDisplay), enabled: cliAvailable)
+            addItem(to: menu, title: "Turn Sleep Prevention Off", action: #selector(turnOff), enabled: cliAvailable)
+        }
         menu.addItem(.separator())
         addItem(to: menu, title: "Refresh Now", action: #selector(refresh))
         addItem(to: menu, title: "Quit NoSleep", action: #selector(quit), enabled: true)
