@@ -17,7 +17,9 @@ Because layer two outlives layer one, the tool keeps an **ownership journal** at
 value was before. Nearly all of the code's complexity exists to keep that journal honest.
 
 A separate, optional **menu bar app** lives in `app/` (`main.swift`, compiled with `swiftc` via
-`make build-app`; `make install-app` signs it with the local Developer ID identity (`sign-app`,
+`make build-app`, which also regenerates `app/AppIcon.icns` from the `ICON_SOURCE` master PNG —
+default `assets/icon-violet-square.png`; `make install-app` signs it with the local Developer ID
+identity (`sign-app`,
 hardened runtime + timestamp; `CODESIGN_IDENTITY` overrides the partial-name match), copies
 `NoSleep.app` to `~/Applications`, and registers the
 `com.callmemorgan.no-sleep.menubar` LaunchAgent). `make notarize-app` submits to Apple's notary

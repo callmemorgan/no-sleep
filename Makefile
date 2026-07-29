@@ -11,7 +11,7 @@ REFUSE_ROOT = @if [[ "$${EUID}" -eq 0 ]]; then \
 		exit 1; \
 	fi
 
-.PHONY: all install uninstall test check build-app sign-app notarize-app install-app uninstall-app
+.PHONY: all install uninstall test check icon build-app sign-app notarize-app install-app uninstall-app
 
 all: check
 
@@ -58,10 +58,33 @@ AGENT_PLIST := $(HOME)/Library/LaunchAgents/$(AGENT_LABEL).plist
 # with a full identity string if several Developer ID certificates exist.
 CODESIGN_IDENTITY ?= Developer ID Application
 
-build-app:
+# App icon: the .icns is regenerated from a full-bleed square master PNG
+# (1024x1024; the system applies the squircle mask itself, so the artwork
+# must fill the canvas edge to edge). Swap ICON_SOURCE to try another
+# master from assets/.
+ICON_SOURCE ?= assets/icon-violet-square.png
+APP_ICON := app/AppIcon.icns
+ICONSET_DIR := $(BUILD_DIR)/AppIcon.iconset
+
+icon: $(APP_ICON)
+
+$(APP_ICON): $(ICON_SOURCE)
+	/bin/rm -rf "$(ICONSET_DIR)"
+	/usr/bin/install -d "$(ICONSET_DIR)"
+	@for size in 16 32 128 256 512; do \
+		/usr/bin/sips -z $$size $$size "$(ICON_SOURCE)" \
+			--out "$(ICONSET_DIR)/icon_$${size}x$${size}.png" >/dev/null; \
+		/usr/bin/sips -z $$((size * 2)) $$((size * 2)) "$(ICON_SOURCE)" \
+			--out "$(ICONSET_DIR)/icon_$${size}x$${size}@2x.png" >/dev/null; \
+	done
+	/usr/bin/iconutil -c icns -o "$(APP_ICON)" "$(ICONSET_DIR)"
+	@echo "Built $(APP_ICON) from $(ICON_SOURCE)"
+
+build-app: icon
 	/usr/bin/install -d "$(APP_BUILT)/Contents/MacOS" "$(APP_BUILT)/Contents/Resources"
 	/usr/bin/xcrun swiftc -O -o "$(APP_BUILT)/Contents/MacOS/$(APP_NAME)" app/main.swift
 	/usr/bin/install -m 0644 app/Info.plist "$(APP_BUILT)/Contents/Info.plist"
+	/usr/bin/install -m 0644 "$(APP_ICON)" "$(APP_BUILT)/Contents/Resources/AppIcon.icns"
 	/usr/bin/install -m 0755 app/askpass.sh "$(APP_BUILT)/Contents/Resources/no-sleep-askpass"
 	@echo "Built $(APP_BUILT)"
 

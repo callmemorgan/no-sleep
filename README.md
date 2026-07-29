@@ -51,6 +51,9 @@ make install-app
 This builds `NoSleep.app` from `app/main.swift` with `swiftc`, signs it with
 the local Developer ID identity (hardened runtime, secure timestamp), copies
 it to `~/Applications`, and registers a LaunchAgent so it starts at login.
+The app icon is regenerated from a full-bleed 1024x1024 master PNG
+(`ICON_SOURCE`, default `assets/icon-violet-square.png`) into `app/AppIcon.icns`
+during the build.
 Set `CODESIGN_IDENTITY` to a full identity string if several Developer ID
 certificates are present. The icon polls `no-sleep status` every few seconds
 and never prompts for a password. The menu's on/off actions run the CLI
